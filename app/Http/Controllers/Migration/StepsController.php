@@ -2,30 +2,22 @@
 
 namespace App\Http\Controllers\Migration;
 
-use App\Models\User;
-use App\Models\Credit;
-use App\Models\Contact;
-use App\Models\Invoice;
-use App\Models\Payment;
-use App\Models\Product;
-use App\Models\TaxRate;
+use App\Http\Controllers\BaseController;
+use App\Http\Requests\MigrationAuthRequest;
+use App\Http\Requests\MigrationCompaniesRequest;
+use App\Http\Requests\MigrationEndpointRequest;
+use App\Http\Requests\MigrationForwardRequest;
+use App\Http\Requests\MigrationTypeRequest;
 use App\Libraries\Utils;
-use App\Models\Document;
-use App\Models\PaymentMethod;
-use App\Models\AccountGateway;
-use App\Models\AccountGatewayToken;
+use App\Models\Account;
+use App\Services\Migration\AuthService;
+use App\Services\Migration\CompanyService;
+use App\Services\Migration\CompleteService;
 use App\Traits\GenerateMigrationResources;
 use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\Crypt;
-use App\Models\AccountGatewaySettings;
-use App\Services\Migration\AuthService;
-use App\Http\Controllers\BaseController;
-use App\Services\Migration\CompanyService;
-use App\Http\Requests\MigrationAuthRequest;
-use App\Http\Requests\MigrationTypeRequest;
-use App\Services\Migration\CompleteService;
-use App\Http\Requests\MigrationEndpointRequest;
-use App\Http\Requests\MigrationCompaniesRequest;
+use Illuminate\Support\Facades\Storage;
+use Validator;
+use Illuminate\Http\Request;
 
 class StepsController extends BaseController
 {
@@ -76,52 +68,114 @@ class StepsController extends BaseController
     {
         session()->put('MIGRATION_TYPE', $request->option);
 
-        if($request->option == 0)
-            return redirect('/migration/auth');
+        if ($request->option == 0) {
 
-        return redirect('/migration/endpoint');
+            session()->put('MIGRATION_ENDPOINT', 'https://invoicing.co');
+
+            return redirect(
+                url('/migration/auth')
+            );
+
+            // return redirect(
+            //     url('/migration/endpoint')
+            // );
+        }
+
+        return redirect(
+            url('/migration/endpoint')
+        );
+    }
+
+    public function forwardUrl(Request $request)
+    {
+
+        $rules = [
+            'url' => 'nullable|url',
+        ];
+
+        $validator = Validator::make($request->all(), $rules);
+
+        if ($validator->fails()) {
+            return back()
+                ->withErrors($validator)
+                ->withInput();
+        }
+
+        $account_settings = \Auth::user()->account->account_email_settings;
+
+        if(strlen($request->input('url')) == 0) {
+            $account_settings->is_disabled = false;
+        }
+        else {
+            $account_settings->is_disabled = true;
+        }
+
+        $account_settings->forward_url_for_v5 = rtrim($request->input('url'),'/');
+        $account_settings->save();
+
+        return back();
     }
 
     public function endpoint()
     {
-        if($this->shouldGoBack('endpoint'))
-            return redirect($this->access['endpoint']['redirect']);
+        if ($this->shouldGoBack('endpoint')) {
+            return redirect(
+                url($this->access['endpoint']['redirect'])
+            );
+        }
 
         return view('migration.endpoint');
     }
 
     public function handleEndpoint(MigrationEndpointRequest $request)
     {
-        if($this->shouldGoBack('endpoint'))
-            return redirect($this->access['endpoint']['redirect']);
+        if ($this->shouldGoBack('endpoint')) {
+            return redirect(
+                url($this->access['endpoint']['redirect'])
+            );
+        }
 
-        session()->put('MIGRATION_ENDPOINT', $request->endpoint);
+        session()->put('MIGRATION_ENDPOINT', rtrim($request->endpoint,'/'));
 
-        return redirect('/migration/auth');
+        return redirect(
+            url('/migration/auth')
+        );
     }
 
     public function auth()
     {
-        if($this->shouldGoBack('auth'))
-            return redirect($this->access['auth']['redirect']);
+        if ($this->shouldGoBack('auth')) {
+            return redirect(
+                url($this->access['auth']['redirect'])
+            );
+        }
 
         return view('migration.auth');
     }
 
     public function handleAuth(MigrationAuthRequest $request)
-    {   
-        if($this->shouldGoBack('auth')) {
-            return redirect($this->access['auth']['redirect']);
+    {
+        if ($this->shouldGoBack('auth')) {
+            return redirect(
+                url($this->access['auth']['redirect'])
+            );
         }
 
-        $authentication = (new AuthService($request->email, $request->password))
+        if (auth()->user()->email !== $request->email) {
+            return back()->with('responseErrors', [trans('texts.cross_migration_message')]);
+        }
+
+        $authentication = (new AuthService($request->email, $request->password, $request->has('api_secret') ? $request->api_secret : null))
             ->endpoint(session('MIGRATION_ENDPOINT'))
             ->start();
 
-        if($authentication->isSuccessful()) {
+        if ($authentication->isSuccessful()) {
             session()->put('MIGRATION_ACCOUNT_TOKEN', $authentication->getAccountToken());
+            session()->put('MIGRAITON_API_SECRET', $authentication->getApiSecret());
 
-            return redirect('/migration/companies');
+            return redirect(
+                url('/migration/companies')
+            );
         }
 
         return back()->with('responseErrors', $authentication->getErrors());
@@ -129,15 +183,17 @@ class StepsController extends BaseController
 
     public function companies()
     {
-        if($this->shouldGoBack('companies'))
-            return redirect($this->access['companies']['redirect']);
+        if ($this->shouldGoBack('companies')) {
+            return redirect(
+                url($this->access['companies']['redirect'])
+            );
+        }
 
-        $companyService = (new CompanyService(session('MIGRATION_ACCOUNT_TOKEN')))
-            ->endpoint(session('MIGRATION_ENDPOINT'))
+        $companyService = (new CompanyService())
             ->start();
 
-        if($companyService->isSuccessful()) {
-            return view('migration.companies', ['companies' => $companyService->getCompanies()]);    
+        if ($companyService->isSuccessful()) {
+            return view('migration.companies', ['companies' => $companyService->getCompanies()]);
         }
 
         return response()->json([
@@ -147,19 +203,34 @@ class StepsController extends BaseController
 
     public function handleCompanies(MigrationCompaniesRequest $request)
     {
-        if($this->shouldGoBack('companies'))
-            return redirect($this->access['companies']['redirect']);
-
-        foreach ($request->companies as $company) {
-            $completeService = (new CompleteService(session('MIGRATION_ACCOUNT_TOKEN')))
-            ->file($this->getMigrationFile())
-            ->force(array_key_exists('force', $company))
-            ->company($company['id'])
-            ->endpoint(session('MIGRATION_ENDPOINT'))
-            ->start();
+        if ($this->shouldGoBack('companies')) {
+            return redirect(
+                url($this->access['companies']['redirect'])
+            );
         }
 
-        return view('migration.completed');
+        $completeService = (new CompleteService(session('MIGRATION_ACCOUNT_TOKEN')));
+
+        try {
+            $migrationData = $this->generateMigrationData($request->all());
+
+            
+                $completeService->data($migrationData)
+                ->endpoint(session('MIGRATION_ENDPOINT'))
+                ->start();
+        }
+        catch(\Exception $e){
+            info($e->getMessage());
+            return view('migration.completed', ['customMessage' => $e->getMessage()]);
+        }
+     
+        
+            if ($completeService->isSuccessful()) {
+                return view('migration.completed');
+            }
+
+            return view('migration.completed', ['customMessage' => $completeService->getErrors()[0]]);
+        
     }
 
     public function completed()
@@ -178,9 +249,9 @@ class StepsController extends BaseController
         $redirect = true;
 
         foreach ($this->access[$step]['steps'] as $step) {
-            if(session()->has($step)) {
+            if (session()->has($step)) {
                 $redirect = false;
-            }  else {
+            } else {
                 $redirect = true;
             }
         }
@@ -193,43 +264,73 @@ class StepsController extends BaseController
      *
      * @return string
      */
-    public function getMigrationFile()
+    public function generateMigrationData(array $data): array
     {
-        $this->account = Auth::user()->account;
+        set_time_limit(0);
 
-        $date = date('Y-m-d');
-        $accountKey = $this->account->account_key;
+        $migrationData = [];
 
-        $output = fopen('php://output', 'w') or Utils::fatalError();
+        foreach ($data['companies'] as $company) {
+            $account = Account::where('account_key', $company['id'])->firstOrFail();
 
-        $fileName = "{$accountKey}-{$date}-invoiceninja";
+            $this->account = $account;
 
-        $data = [
-            'company' => $this->getCompany(),
-            'users' => $this->getUsers(),
-            'tax_rates' => $this->getTaxRates(),
-            'clients' => $this->getClients(),
-            'products' => $this->getProducts(),
-            'invoices' => $this->getInvoices(),
-            'quotes' => $this->getQuotes(),
-            'payments' => array_merge($this->getPayments(), $this->getCredits()),
-            'credits' => $this->getCreditsNotes(),
-            'documents' => $this->getDocuments(),
-            'company_gateways' => $this->getCompanyGateways(),
-            'client_gateway_tokens' => $this->getClientGatewayTokens(),
-        ];
+            $date = date('Y-m-d');
+            $accountKey = $this->account->account_key;
 
-        $file = storage_path("{$fileName}.zip");
+            $output = fopen('php://output', 'w') or Utils::fatalError();
 
-        $zip = new \ZipArchive();
-        $zip->open($file, \ZipArchive::CREATE | \ZipArchive::OVERWRITE);
-        $zip->addFromString('migration.json', json_encode($data, JSON_PRETTY_PRINT));
-        $zip->close();
+            $fileName = "{$accountKey}-{$date}-invoiceninja";
+
+            $localMigrationData['data'] = [
+                'account' => $this->getAccount(),
+                'company' => $this->getCompany(),
+                'users' => $this->getUsers(),
+                'tax_rates' => $this->getTaxRates(),
+                'payment_terms' => $this->getPaymentTerms(),
+                'clients' => $this->getClients(),
+                'company_gateways' => $this->getCompanyGateways(),
+                'client_gateway_tokens' => $this->getClientGatewayTokens(),
+                'vendors' => $this->getVendors(),
+                'projects' => $this->getProjects(),
+                'products' => $this->getProducts(),
+                'credits' => $this->getCreditsNotes(),
+                'invoices' => $this->getInvoices(),
+                'recurring_invoices' => $this->getRecurringInvoices(),
+                'quotes' => $this->getQuotes(),
+                'payments' => array_merge($this->getPayments(), $this->getCredits()),
+                'documents' => $this->getDocuments(),
+                'expense_categories' => $this->getExpenseCategories(),
+                'task_statuses' => $this->getTaskStatuses(),
+                'expenses' => $this->getExpenses(),
+                'tasks' => $this->getTasks(),
+                'documents' => $this->getDocuments(),
+                'ninja_tokens' => $this->getNinjaToken(),
+            ];
+
+            $localMigrationData['force'] = array_key_exists('force', $company);
+
+            Storage::makeDirectory('migrations');
+            $file = Storage::path("migrations/{$fileName}.zip");
+
+            //$file = storage_path("migrations/{$fileName}.zip");
+
+            ksort($localMigrationData);
+
+            $zip = new \ZipArchive();
+            $zip->open($file, \ZipArchive::CREATE | \ZipArchive::OVERWRITE);
+            $zip->addFromString('migration.json', json_encode($localMigrationData, JSON_PRETTY_PRINT));
+            $zip->close();
+
+            $localMigrationData['file'] = $file;
+
+            $migrationData[] = $localMigrationData;
+        }
+
+        return $migrationData;
 
         // header('Content-Type: application/zip');
         // header('Content-Length: ' . filesize($file));
         // header("Content-Disposition: attachment; filename={$fileName}.zip");
-
-        return $file;
     }
 }
